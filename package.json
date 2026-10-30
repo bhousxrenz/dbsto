@@ -1,0 +1,37 @@
+{
+  "name": "nursyncbackend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "[![Ask DeepWiki](https://devin.ai/assets/askdeepwiki.png)](https://deepwiki.com/HearnsMori/dbstorage)",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.2.1",
+    "express-session": "^1.18.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.13.2",
+    "nodemailer": "^8.0.5",
+    "nodemon": "^3.1.14",
+    "uuid": "^13.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HearnsMori/core-api.git"
+  },
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/HearnsMori/core-api/issues"
+  },
+  "homepage": "https://github.com/HearnsMori/core-api#readme"
+}
