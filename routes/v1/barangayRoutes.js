@@ -10,6 +10,9 @@ router.get('/sync', verifyToken, c.sync);
 // Photos (public read, so the app can load them with a plain URL)
 router.get('/images/:kind/:id', c.image);
 
+// From here on, citizens blocked for repeated violations are refused
+router.use(verifyToken, c.rejectBlocked);
+
 // Own profile photo (admin and citizens alike); everybody can then load it via /images/users/:userId
 router.put('/profile-photo', verifyToken, c.setProfilePhoto);
 router.delete('/profile-photo', verifyToken, c.removeProfilePhoto);
@@ -41,5 +44,9 @@ router.post('/notifications/read', verifyToken, c.markNotificationsRead);
 // Resident verification: citizen's uploaded ID + admin decision (admin only - this is private)
 router.get('/users/:userId/id-photo', verifyToken, requireAdmin, c.getIdPhoto);
 router.patch('/users/:userId/verify', verifyToken, requireAdmin, c.setVerification);
+
+// Sanctions for inappropriate language / content (admin) and a citizen editing their own info
+router.patch('/users/:userId/sanction', verifyToken, requireAdmin, c.setSanction);
+router.patch('/profile', verifyToken, c.updateMyProfile);
 
 module.exports = router;
