@@ -5,10 +5,11 @@ const ChatMessage = require('../../models/ChatMessage');
 const AppNotification = require('../../models/AppNotification');
 const User = require('../../models/User');
 const { adminIds } = require('../../middlewares/requireAdmin');
+const { findProfanity } = require('../../utils/profanity');
 
 const ADMIN_NAME = 'Barangay 201 Admin';
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
-const REACTIONS = ['👍', '❤️', '😆', '😮', '😢', '😡', 'DISLIKE'];  // DISLIKE = the thumbs-down button
+const REACTIONS = ['DISLIKE'];  // DISLIKE = the thumbs-down button
 const DOC_TYPES = ['CERTIFICATE', 'CLEARANCE', 'ID'];
 const DOC_LABELS = { CERTIFICATE: 'Barangay Certificate', CLEARANCE: 'Barangay Clearance', ID: 'Barangay ID' };
 
@@ -84,6 +85,88 @@ async function notify({ recipient, title, message, type, refId = 0, extra = '', 
 const notificationFilter = (req) =>
   isAdmin(req) ? { recipient: 'ADMIN' } : { recipient: { $in: ['ALL', req.user.userId] } };
 
+// ───────────────────────── SANCTIONS (inappropriate language / content) ─────────────────────────
+// Ladder, per violation inside a 90-day window:
+//   1st  -> warning                     2nd -> final warning
+//   3rd  -> commenting suspended 1 day  4th -> ACCOUNT BLOCKED for 7 days  5th and more -> BLOCKED for 30 days
+// A blocked citizen cannot log in or use the app until the time is up (or the admin lifts it). While only
+// suspended, a citizen can still read the app, message the barangay and request documents.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const STRIKE_WINDOW_MS = 90 * DAY_MS;
+const MAX_SANCTION_LOG = 30;
+
+const whenText = (d) => new Date(d).toLocaleString('en-PH', {
+  timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+});
+const mutedNow = (u) => !!(u.mutedUntil && u.mutedUntil.getTime() > Date.now());
+const blockedNow = (u) => !!(u.blockedUntil && u.blockedUntil.getTime() > Date.now());
+
+// Adds a strike to a citizen, applies the ladder, and notifies the citizen and the admin.
+// Returns { strikes, mutedUntil (ms or 0), citizenMessage }.
+async function addStrike(userId, { reason, by = 'system', displayName = userId, manual = false }) {
+  const u = await User.findOne({ userId });
+  if (!u) throw new HttpError(404, 'User not found');
+
+  const now = Date.now();
+  if (u.lastStrikeAt && now - u.lastStrikeAt.getTime() > STRIKE_WINDOW_MS) u.strikes = 0;   // clean record -> fresh start
+  u.strikes = (u.strikes || 0) + 1;
+  u.lastStrikeAt = new Date(now);
+
+  let action = 'WARNING';
+  let consequence;
+  if (u.strikes >= 4) {
+    const days = u.strikes === 4 ? 7 : 30;
+    u.blockedUntil = new Date(now + days * DAY_MS);
+    action = `BLOCK_${days}D`;
+    consequence = `Your account is BLOCKED for ${days} days (until ${whenText(u.blockedUntil)}). You cannot use the app until then.`;
+  } else if (u.strikes === 3) {
+    u.mutedUntil = new Date(now + DAY_MS);
+    action = 'MUTE_1D';
+    consequence = `You cannot comment or reply until ${whenText(u.mutedUntil)} (1 day). One more violation will block your account.`;
+  } else if (u.strikes === 2) {
+    consequence = 'This is your FINAL warning. At 3 violations your commenting is suspended, at 4 your account is blocked for 7 days, and from 5 for 30 days.';
+  } else {
+    consequence = 'Please keep the community respectful. Repeated violations will suspend and then block your account.';
+  }
+
+  u.sanctionLog = [...(u.sanctionLog || []), { at: new Date(now), action, reason, by }].slice(-MAX_SANCTION_LOG);
+  await u.save();
+
+  const lead = manual ? 'The barangay admin issued you a warning' : 'Your post was blocked';
+  const citizenMessage = `${lead}: ${reason}. Violation ${u.strikes}. ${consequence}`;
+  await notify({
+    recipient: userId,
+    title: u.strikes >= 4 ? 'Account blocked' : u.strikes === 3 ? 'Account sanction: commenting suspended' : (u.strikes === 2 ? 'Final warning' : 'Warning: inappropriate content'),
+    message: citizenMessage, type: 'SANCTION', extra: String(u.strikes),
+  });
+  await notify({
+    recipient: 'ADMIN',
+    title: `${displayName} was sanctioned`,
+    message: `${reason}. Violation ${u.strikes}${u.strikes >= 4 ? ` - account BLOCKED until ${whenText(u.blockedUntil)}` : u.strikes === 3 ? ` - commenting suspended until ${whenText(u.mutedUntil)}` : ''}.`,
+    type: 'SANCTION', extra: userId,
+  });
+  return { strikes: u.strikes, mutedUntil: u.mutedUntil ? ms(u.mutedUntil) : 0, blockedUntil: u.blockedUntil ? ms(u.blockedUntil) : 0, citizenMessage };
+}
+
+// Blocks a citizen who is currently suspended from commenting / replying.
+async function assertNotMuted(req) {
+  if (isAdmin(req)) return;
+  const u = await User.findOne({ userId: req.user.userId }).select('mutedUntil');
+  if (u && mutedNow(u)) {
+    throw new HttpError(403, `Your commenting is suspended until ${whenText(u.mutedUntil)} because of inappropriate language.`);
+  }
+}
+
+// Rejects (and sanctions) a citizen's text that contains bad words. The admin is never screened.
+async function screenText(req, value, where) {
+  if (isAdmin(req)) return;
+  const bad = findProfanity(value);
+  if (!bad) return;
+  const name = await displayName(req);
+  const r = await addStrike(req.user.userId, { reason: `inappropriate language in a ${where}`, displayName: name });
+  throw new HttpError(422, r.citizenMessage);
+}
+
 // ───────────────────────── serializers (JSON the app receives) ─────────────────────────
 
 const pubReplyish = (c) => ({
@@ -158,7 +241,7 @@ exports.sync = handle(async (req, res) => {
   if (admin) {
     // Citizens the admin can chat with
     const users = await User.find({ userId: { $nin: adminIds() }, status: 'active' })
-      .select('userId userData hasIdPhoto verification verifiedAt hasProfilePhoto profilePhotoUpdatedAt');
+      .select('userId userData hasIdPhoto verification verifiedAt hasProfilePhoto profilePhotoUpdatedAt strikes mutedUntil blockedUntil');
     const field = (u, k, d = '') => (u.userData && u.userData.get(k)) ?? d;
     data.citizens = users.map(u => ({
       userId: u.userId,
@@ -172,6 +255,9 @@ exports.sync = handle(async (req, res) => {
       verifiedAt: u.verifiedAt ? ms(u.verifiedAt) : 0,
       hasProfilePhoto: !!u.hasProfilePhoto,
       photoUpdatedAt: u.profilePhotoUpdatedAt ? ms(u.profilePhotoUpdatedAt) : 0,
+      strikes: u.strikes || 0,
+      mutedUntil: mutedNow(u) ? ms(u.mutedUntil) : 0,
+      blockedUntil: blockedNow(u) ? ms(u.blockedUntil) : 0,
     }));
   }
 
@@ -193,10 +279,13 @@ exports.sync = handle(async (req, res) => {
   // Every citizen gets their own verification status back, so the app can gate access:
   // PENDING/REJECTED citizens are blocked from the main app until the admin verifies them.
   if (!admin) {
-    const meUser = await User.findOne({ userId: me }).select('verification hasIdPhoto verifiedAt');
+    const meUser = await User.findOne({ userId: me }).select('verification hasIdPhoto verifiedAt strikes mutedUntil blockedUntil');
     data.myVerification = (meUser && meUser.verification) || 'PENDING';
     data.myHasIdPhoto = !!(meUser && meUser.hasIdPhoto);
     data.myVerifiedAt = meUser && meUser.verifiedAt ? ms(meUser.verifiedAt) : 0;
+    data.myStrikes = (meUser && meUser.strikes) || 0;
+    data.myBlockedUntil = meUser && blockedNow(meUser) ? ms(meUser.blockedUntil) : 0;
+    data.myMutedUntil = meUser && mutedNow(meUser) ? ms(meUser.mutedUntil) : 0;
   } else {
     data.myVerification = 'VERIFIED';
     data.myHasIdPhoto = false;
@@ -279,6 +368,8 @@ exports.deleteAnnouncement = handle(async (req, res) => {
 
 exports.addComment = handle(async (req, res) => {
   const id = numId(req.params.id);
+  await assertNotMuted(req);
+  await screenText(req, req.body.text, 'comment');
   const author = await displayName(req);
   const c = {
     id: newId(), authorId: req.user.userId, authorName: author,
@@ -296,6 +387,8 @@ exports.addComment = handle(async (req, res) => {
 exports.addReply = handle(async (req, res) => {
   const id = numId(req.params.id);
   const commentId = numId(req.params.commentId);
+  await assertNotMuted(req);
+  await screenText(req, req.body.text, 'reply');
   const a = await Announcement.findOne({ id });
   if (!a) throw new HttpError(404, 'Announcement not found');
   const parent = a.comments.find(c => c.id === commentId);
@@ -443,6 +536,7 @@ exports.sendMessage = handle(async (req, res) => {
   const me = req.user.userId;
   const admin = isAdmin(req);
   const body = text(req.body.text, { max: 2000 });
+  await screenText(req, body, 'message');
 
   let threadKey = me;
   if (admin) {
@@ -512,6 +606,102 @@ exports.setVerification = handle(async (req, res) => {
 });
 
 
+// ───────────────────────── MANUAL SANCTIONS (admin) ─────────────────────────
+// body: { action: "WARN" | "MUTE" | "BLOCK" | "LIFT", days?: 1 | 7 | 30 (MUTE) or 7 | 30 (BLOCK), reason?: string }
+exports.setSanction = handle(async (req, res) => {
+  const userId = req.params.userId;
+  if (adminIds().includes(userId)) throw new HttpError(400, 'Admin accounts cannot be sanctioned');
+  const action = String(req.body.action || '').toUpperCase();
+  if (!['WARN', 'MUTE', 'BLOCK', 'LIFT'].includes(action)) throw new HttpError(400, 'action must be WARN, MUTE, BLOCK or LIFT');
+
+  const u = await User.findOne({ userId });
+  if (!u) throw new HttpError(404, 'User not found');
+  const name = (u.userData && u.userData.get('fullName')) || userId;
+  const reason = text(req.body.reason, { max: 200, required: false, fallback: 'violation of the community guidelines' });
+
+  if (action === 'WARN') {
+    const r = await addStrike(userId, { reason, by: req.user.userId, displayName: name, manual: true });
+    return ok(res, { userId, strikes: r.strikes, mutedUntil: r.mutedUntil, blockedUntil: r.blockedUntil });
+  }
+
+  if (action === 'MUTE') {
+    const days = [1, 7, 30].includes(Number(req.body.days)) ? Number(req.body.days) : 1;
+    u.mutedUntil = new Date(Date.now() + days * DAY_MS);
+    u.sanctionLog = [...(u.sanctionLog || []), { at: new Date(), action: `MUTE_${days}D`, reason, by: req.user.userId }].slice(-MAX_SANCTION_LOG);
+    await u.save();
+    await notify({
+      recipient: userId, title: 'Account sanction: commenting suspended', type: 'SANCTION', extra: String(u.strikes || 0),
+      message: `The barangay admin suspended your commenting until ${whenText(u.mutedUntil)} (${days} day${days > 1 ? 's' : ''}): ${reason}.`,
+    });
+    return ok(res, { userId, strikes: u.strikes || 0, mutedUntil: ms(u.mutedUntil) });
+  }
+
+  if (action === 'BLOCK') {
+    const days = [7, 30].includes(Number(req.body.days)) ? Number(req.body.days) : 7;
+    u.blockedUntil = new Date(Date.now() + days * DAY_MS);
+    u.sanctionLog = [...(u.sanctionLog || []), { at: new Date(), action: `BLOCK_${days}D`, reason, by: req.user.userId }].slice(-MAX_SANCTION_LOG);
+    await u.save();
+    await notify({
+      recipient: userId, title: 'Account blocked', type: 'SANCTION', extra: String(u.strikes || 0),
+      message: `The barangay admin blocked your account for ${days} days (until ${whenText(u.blockedUntil)}): ${reason}.`,
+    });
+    return ok(res, { userId, strikes: u.strikes || 0, mutedUntil: u.mutedUntil ? ms(u.mutedUntil) : 0, blockedUntil: ms(u.blockedUntil) });
+  }
+
+  // LIFT: clean slate
+  u.strikes = 0;
+  u.mutedUntil = undefined;
+  u.blockedUntil = undefined;
+  u.lastStrikeAt = undefined;
+  u.sanctionLog = [...(u.sanctionLog || []), { at: new Date(), action: 'LIFT', reason, by: req.user.userId }].slice(-MAX_SANCTION_LOG);
+  await u.save();
+  await notify({
+    recipient: userId, title: 'Sanction lifted', type: 'SANCTION', extra: '0',
+    message: 'Your warnings were cleared and your account can be used again. Thank you for keeping the community respectful.',
+  });
+  ok(res, { userId, strikes: 0, mutedUntil: 0 });
+});
+
+// ───────────────────────── EDIT MY INFO (citizens) ─────────────────────────
+// body: any of { fullName, contact, address, age, email }
+const GMAIL_RE = /^[a-z0-9._+-]+@gmail\.com$/;
+exports.updateMyProfile = handle(async (req, res) => {
+  if (isAdmin(req)) throw new HttpError(403, 'Only citizens can edit their info here');
+  const u = await User.findOne({ userId: req.user.userId });
+  if (!u) throw new HttpError(404, 'User not found');
+  const b = req.body || {};
+  const set = (k, v) => { if (!u.userData) u.userData = new Map(); u.userData.set(k, v); };
+
+  if (b.fullName !== undefined) {
+    const v = text(b.fullName, { max: 100 });
+    if (v.length < 2) throw new HttpError(400, 'Please enter your full name');
+    set('fullName', v);
+  }
+  if (b.contact !== undefined) {
+    const v = text(b.contact, { max: 20, required: false });
+    if (v && !/^[0-9+\-\s()]{7,20}$/.test(v)) throw new HttpError(400, 'Enter a valid contact number');
+    set('contact', v);
+  }
+  if (b.address !== undefined) set('address', text(b.address, { max: 300, required: false }));
+  if (b.age !== undefined) {
+    const n = Number(b.age);
+    if (!Number.isInteger(n) || n < 1 || n > 120) throw new HttpError(400, 'Enter a valid age');
+    set('age', n);
+  }
+  if (b.email !== undefined) {
+    const v = String(b.email).trim().toLowerCase();
+    if (!GMAIL_RE.test(v)) throw new HttpError(400, 'Enter a valid Gmail address');
+    const taken = await User.exists({ 'userData.email': v, userId: { $ne: u.userId } });
+    if (taken) throw new HttpError(409, 'That Gmail is already used by another account');
+    set('email', v);
+  }
+  u.markModified('userData');
+  await u.save();
+
+  const f = (k, d = '') => (u.userData && u.userData.get(k)) ?? d;
+  ok(res, { fullName: f('fullName', u.userId), contact: f('contact'), address: f('address'), age: Number(f('age', 0)) || 0, email: f('email') });
+});
+
 // ───────────────────────── PROFILE PHOTO (admin + citizens) ─────────────────────────
 
 // body: { photo: base64 JPEG/PNG (or data: URI) }
@@ -536,3 +726,16 @@ exports.removeProfilePhoto = handle(async (req, res) => {
   await u.save();
   ok(res, { userId: u.userId, hasProfilePhoto: false, photoUpdatedAt: ms(u.profilePhotoUpdatedAt) });
 });
+
+// Every barangay request except /sync: a blocked citizen can no longer post, comment, request documents...
+// (/sync itself still answers, with myBlockedUntil set, so the app knows to show the "blocked" screen.)
+exports.rejectBlocked = async (req, res, next) => {
+  try {
+    if (isAdmin(req)) return next();
+    const u = await User.findOne({ userId: req.user.userId }).select('blockedUntil');
+    if (u && blockedNow(u)) {
+      return res.status(403).json({ success: false, message: `Your account is blocked until ${whenText(u.blockedUntil)} because of repeated violations.`, error: null, meta: null, data: null });
+    }
+    next();
+  } catch (err) { next(err); }
+};
