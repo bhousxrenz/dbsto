@@ -32,6 +32,18 @@ const UserSchema = new mongoose.Schema({
   profilePhoto: { type: { data: Buffer, contentType: String }, select: false },
   hasProfilePhoto: { type: Boolean, default: false },
   profilePhotoUpdatedAt: { type: Date },
+
+  // Sanctions for inappropriate language / content (see barangayController).
+  // strikes: violations in the current period (reset after 90 quiet days); mutedUntil: no commenting before this time.
+  strikes: { type: Number, default: 0 },
+  lastStrikeAt: { type: Date },
+  mutedUntil: { type: Date },
+  // 4th violation: blocked for 7 days, 5th and more: 30 days (login refused until then). The admin can lift it.
+  blockedUntil: { type: Date },
+  sanctionLog: {
+    type: [{ at: Date, action: String, reason: String, by: String, _id: false }],
+    default: [],
+  },
 }, { timestamps: true });
 
 UserSchema.pre('save', async function (next) {
